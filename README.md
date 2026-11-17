@@ -11,6 +11,7 @@
 - **并发**：ThreadPoolExecutor 并发检索多个子问题，map 保序，总耗时压到单次搜索级别
 - **可靠性**：幻觉抑制（"带引用却未检索"时补搜重答）+ 引用校验闭环（编号越界时带反馈重答）、工具参数校验、ast 白名单安全计算、防死循环
 - **服务化**：FastAPI + Pydantic 参数校验，自动生成 OpenAPI 文档
+- **测试**：12 项 unittest 单测，搜索与模型全部打桩，零成本验证核心逻辑
 
 ## 环境要求
 
@@ -72,12 +73,23 @@ uvicorn api:app --reload
 
 响应包含 `report`（报告正文）、`sub_questions`（拆解的子问题）、`sub_question_count`（子问题数）、`sources_count`（去重后来源数）。
 
+## 测试
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+12 项单测覆盖：ast 白名单安全计算（含恶意代码拦截）、标题清洗与去重、引用编号校验与越界重答闭环、并发检索保序、任务拆解容错、端到端结构。
+
+搜索和模型调用全部用 mock 打桩，**不需要配置 key、不联网、不消耗 API 额度**，clone 后可直接运行。
+
 ## 文件结构
 
 | 文件 | 说明 |
 | --- | --- |
 | `agent_demo.py` | 核心逻辑：ReAct 循环、工具层、公共步骤层（搜索+信息层复用）、并发检索、任务拆解、引用校验闭环、报告生成 |
 | `api.py` | FastAPI 服务封装，`/research` 接口 |
+| `tests/test_agent.py` | 12 项单元测试（外部依赖全打桩，零成本运行） |
 | `requirements.txt` | 依赖清单 |
 | `.env.example` | 环境变量示例（需自行复制为 `.env` 并填入 key） |
 
