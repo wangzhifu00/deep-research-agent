@@ -1,21 +1,19 @@
 """
-agent_demo.py - 最小 agent 闭环（接入百炼真模型版）
+agent_demo.py - 深度研究 Agent（ReAct + Function Calling + 多轮调研）
 
-对照讲解里的消息流图：
-  ① system      定义角色和工具
-  ② user        用户提问
-  ③ assistant   模型返回"调用请求"（不是文字）
-      ↓ 你的代码执行工具
-  ④ tool        把执行结果作为新消息塞回去
-  ⑤ assistant   模型返回文字答案，循环结束
+单轮 ReAct（run_agent）：
+  system → user → assistant(调用请求) → 代码执行工具 → tool(结果) → assistant(答案)
 
-架构不变：call_model 是唯一和"模型"相关的地方。
-  - 真模型：走百炼 OpenAI 兼容接口
-  - 假模型：设环境变量 USE_FAKE_MODEL=1，无需 key 也能跑，方便对照
+多轮调研（run_deep_research / research）：
+  ① 规划：模型自主拆 3-4 个子问题
+  ② 并发搜索：ThreadPoolExecutor 并发检索（结果保序）
+  ③ 信息层：跨批次去重 → 排序 → 全局重新编号
+  ④ 生成报告：基于全部材料作答
+  ⑤ 引用校验闭环：越界编号 → 带反馈重答，最多 MAX_CITATION_RETRY 次
 
 运行前：
   在 Windows 用户环境变量里设好 DASHSCOPE_API_KEY、BOCHA_API_KEY
-  pip install openai
+  pip install -r requirements.txt
 """
 
 import json
@@ -23,6 +21,7 @@ import os
 import re
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 
 # ============================================================
 # 第 0 块：配置 —— 直接从环境变量读取
@@ -31,12 +30,12 @@ API_KEY = os.getenv("DASHSCOPE_API_KEY", "")       # 百炼 key
 BOCHA_KEY = os.getenv("BOCHA_API_KEY", "")         # 博查搜索 key
 MODEL = os.getenv("MODEL_NAME", "qwen-flash")
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-USE_FAKE = os.getenv("USE_FAKE_MODEL", "0") == "1"
-MAX_STEPS = 10  # 防止模型反复调工具导致死循环
+MAX_STEPS = 10                 # ReAct 单轮最大步数，防止死循环
+MAX_CITATION_RETRY = 2         # 报告引用越界时，最多带反馈重答几次
 
 
 # ============================================================
-# 第 1 块：工具函数 —— 就一个：联网搜索
+# 第 1 块：工具函数 —— 三个工具
 # ============================================================
 def search_web(query: str, count: int = 5) -> dict:
     """调用博查 Web Search API"""
@@ -78,6 +77,7 @@ def search_web(query: str, count: int = 5) -> dict:
             "site": p.get("siteName", ""),
         })
     return {"query": query, "results": results}
+
 
 def calculate(expression: str) -> dict:
     """四则运算，用 ast 白名单解析，不用裸 eval"""
@@ -131,7 +131,6 @@ def process_results(query: str, results: list) -> list:
     seen, unique = [], []
     for r in results:
         key = _title_key(r["title"])
-        # 两个标题足够长且互为前缀 → 判定为同一篇转载
         duplicate = any(
             len(k) >= 15 and len(key) >= 15 and (k.startswith(key) or key.startswith(k))
             for k in seen
@@ -164,6 +163,69 @@ def format_context(results: list) -> str:
             f"    摘要：{r['snippet'][:400]}"
         )
     return "\n\n".join(lines)
+
+
+# ============================================================
+# 第 1.6 块：公共步骤层 —— 三条流程共用，消除重复代码
+# ============================================================
+def _clean(s: str) -> str:
+    """清洗 HTML 实体和多余空白，只用于日志显示（喂给模型的是原文）"""
+    for _ in range(2):
+        s = s.replace("&nbsp;", " ").replace("&amp;", "&")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def log_results(results: list):
+    """统一打印编号结果日志（命令行演示用）"""
+    print(f"   [工具返回] 共 {len(results)} 条：")
+    for r in results:
+        title = re.split(r"\s+-\s+", _clean(r["title"]))[0][:34]
+        site = re.sub(r"\s+", "", _clean(r["site"]))
+        snippet = _clean(r["snippet"])[:80]
+        print(f"      [{r['n']}] {title}（{site}）")
+        print(f"          {snippet}...")
+
+
+def search_and_process(query: str, verbose: bool = False) -> list:
+    """公共步骤：联网搜索 → 信息层去重排序编号 → 返回结果列表。
+
+    verbose=True 时打印过程日志（命令行演示）；API 模式传 False 保持纯函数。
+    run_agent / run_deep_research / research 三处都调用这一个实现。
+    """
+    result = search_web(query)
+    if "results" not in result or not result["results"]:
+        if verbose:
+            print(f"   [搜索失败] {result.get('error', '无结果')}")
+        return []
+    before = len(result["results"])
+    processed = process_results(query, result["results"])
+    if verbose:
+        print(f"   [信息层] 去重排序：{before} 条 → {len(processed)} 条")
+        log_results(processed)
+    return processed
+
+
+def collect_batches(subs: list, verbose: bool = False) -> list:
+    """公共步骤：对多个子问题批量搜索，返回所有批次结果（保持子问题顺序）。
+
+    verbose=True：串行 + 打印（演示时看得清每个子问题）；
+    verbose=False：ThreadPoolExecutor 并发（API 提速），map 天然保序。
+    """
+    if verbose:
+        batches = []
+        for i, sub in enumerate(subs, 1):
+            print(f"\n   --- 子问题 {i}/{len(subs)}：{sub} ---")
+            batches.extend(search_and_process(sub, verbose=True))
+        return batches
+
+    if not subs:
+        return []
+    with ThreadPoolExecutor(max_workers=min(len(subs), 4)) as ex:
+        groups = list(ex.map(lambda q: search_and_process(q, verbose=False), subs))
+    batches = []
+    for group in groups:
+        batches.extend(group)
+    return batches
 
 
 # ============================================================
@@ -217,18 +279,7 @@ TOOLS_SCHEMA = [
 # ============================================================
 # 第 3 块：call_model —— 唯一和"模型"相关的地方
 # ============================================================
-# 真模型 / 假模型都返回统一结构：
-#   {
-#     "content": 文字答案 或 None,
-#     "tool_calls": [{"id", "name", "arguments"}] 或 None,
-#     "assistant_msg": 要追加进 messages 的 assistant 消息
-#   }
-# 这样下面的循环完全不用关心用的是谁。
-def call_model(messages: list, force_tool: bool = False) -> dict:
-    if USE_FAKE:
-        return _fake_model(messages)
-
-    # 延迟导入：假模型模式下不需要装 openai
+def call_model(messages: list) -> dict:
     from openai import OpenAI
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
@@ -236,9 +287,7 @@ def call_model(messages: list, force_tool: bool = False) -> dict:
         model=MODEL,
         messages=messages,
         tools=TOOLS_SCHEMA,
-        # required=强制调工具（第一轮用，防止没搜索就凭空回答）；
-        # auto=让模型自己决定调工具还是直接回答
-        tool_choice="required" if force_tool else "auto",
+        tool_choice="auto",  # 工具选择权交给模型自己判断
     )
     msg = resp.choices[0].message
 
@@ -262,39 +311,13 @@ def call_model(messages: list, force_tool: bool = False) -> dict:
     }
 
 
-def _fake_model(messages: list) -> dict:
-    """假模型：按关键词模拟决定，返回值结构和真模型一致"""
-    last = messages[-1]
-
-    if last["role"] == "user":
-        q = last["content"]
-        # 只有一个工具，所有问题都走搜索
-        return {
-            "content": None,
-            "tool_calls": [{"id": "fake_1", "name": "search_web", "arguments": {"query": q}}],
-            "assistant_msg": {"role": "assistant", "content": None,
-                              "tool_calls": [{"id": "fake_1", "type": "function",
-                                              "function": {"name": "search_web",
-                                                           "arguments": json.dumps({"query": q}, ensure_ascii=False)}}]},
-        }
-
-    if last["role"] == "tool":
-        # 现在工具返回的是整理后的文本，直接把它当参考材料展示
-        answer = "搜索到这些结果（已去重排序编号）：\n" + last["content"][:600]
-        return {"content": answer, "tool_calls": None,
-                "assistant_msg": {"role": "assistant", "content": answer}}
-
-    return {"content": "我不知道该怎么处理。", "tool_calls": None,
-            "assistant_msg": {"role": "assistant", "content": "我不知道该怎么处理。"}}
-
-
 # ============================================================
-# 第 4 块：agent 循环 —— 整个项目的心脏（和假模型版几乎一样）
+# 第 4 块：ReAct 单轮循环（和深度研究并存，可随时切回对比）
 # ============================================================
 def run_agent(question: str):
     print("=" * 60)
     print(f"用户提问：{question}")
-    print(f"当前模型：{'假模型' if USE_FAKE else MODEL}")
+    print(f"当前模型：{MODEL}")
     print("=" * 60)
 
     messages = [
@@ -310,47 +333,33 @@ def run_agent(question: str):
         {"role": "user", "content": question},
     ]
 
-    # B 方案标记：幻觉拦截（强制补搜）最多执行一次，防止死循环
+    # 幻觉拦截（强制补搜）最多执行一次，防止死循环
     hallucination_fixed = False
 
     for step in range(1, MAX_STEPS + 1):
         print(f"\n--- 第 {step} 轮 ---")
 
-        # ③：问模型（工具选择交给模型自己决定）
         reply = call_model(messages)
         messages.append(reply["assistant_msg"])
 
-        # 判断：要调工具，还是给答案？
         if reply["tool_calls"]:
             for call in reply["tool_calls"]:
                 name = call["name"]
                 args = call["arguments"]
                 print(f"   [模型决定调工具] {name}({args})")
-                result = TOOL_FUNCS[name](**args)
-
-                # 搜索结果先过信息层：去重 → 排序 → 编号
-                if name == "search_web" and "results" in result:
-                    before = len(result["results"])
-                    results = process_results(args["query"], result["results"])
-                    print(f"   [信息层] 去重排序：{before} 条 → {len(results)} 条")
+                if name == "search_web":
+                    # 复用公共步骤：搜索 → 信息层 → 打印日志
+                    results = search_and_process(args.get("query", ""), verbose=True)
                     content = format_context(results)
-                    # 日志：每条都显示，摘要压成单行、只取前 80 字（塞给模型的是完整内容）
-                    def _clean(s):
-                        for _ in range(2):  # 处理 &amp;nbsp; 这种双重转义
-                            s = s.replace("&nbsp;", " ").replace("&amp;", "&")
-                        return re.sub(r"\s+", " ", s).strip()  # 换行/多空格压成一个空格
-
-                    print(f"   [工具返回] 共 {len(results)} 条：")
-                    for r in results:
-                        title = re.split(r"\s+-\s+", _clean(r["title"]))[0][:34]  # 去掉标题里的网站后缀
-                        site = re.sub(r"\s+", "", _clean(r["site"]))  # 去掉所有空白（含全角/不间断空格）
-                        snippet = _clean(r["snippet"])[:80]
-                        print(f"      [{r['n']}] {title}（{site}）")
-                        print(f"          {snippet}...")
                 else:
-                    content = json.dumps(result, ensure_ascii=False)
+                    fn = TOOL_FUNCS.get(name)
+                    if fn is None:
+                        content = json.dumps({"error": f"未知工具：{name}"}, ensure_ascii=False)
+                    else:
+                        result = fn(**args)
+                        content = json.dumps(result, ensure_ascii=False)
                     print(f"   [工具返回] {content[:300]}...")
-                # ④：结果作为 tool 消息塞回去，tool_call_id 用来对上是哪次调用
+                # 结果作为 tool 消息塞回去，tool_call_id 用来对上是哪次调用
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call["id"],
@@ -358,12 +367,10 @@ def run_agent(question: str):
                 })
             continue
         else:
-            # ⑤：文字答案 —— 出结果前先做"幻觉校验"（B 方案）
+            # 文字答案 —— 出结果前做"幻觉校验"
             answer = reply["content"] or ""
-            # 答案里是否带 [编号] 引用
             refs = re.findall(r"\[\d+\]", answer)
-            # 消息历史里是否真的有搜索结果（带 [n] 的 tool 消息）
-            # 注意：messages 里既有 dict，也有真模型返回的 ChatCompletionMessage 对象
+            # messages 里既有 dict，也有真模型返回的 ChatCompletionMessage 对象
             def _field(m, key):
                 return m.get(key) if isinstance(m, dict) else getattr(m, key, None)
 
@@ -373,15 +380,13 @@ def run_agent(question: str):
             )
 
             if refs and not has_search and not hallucination_fixed:
-                # 造假：标了引用却从没搜过 → 撤掉这条答案，强制补搜一次让它重答
-                print(f"   [幻觉拦截] 答案带引用 {refs} 但从未搜索 → 强制补搜")
-                fake_msg = reply["assistant_msg"]
-                messages.pop()  # 撤掉刚塞进去的这条造假答案
-                result = TOOL_FUNCS["search_web"](query=question)
-                if "results" in result:
-                    results = process_results(question, result["results"])
+                # 造假：标了引用却从没搜过 → 撤掉答案，强制补搜一次让它重答
+                print("   [幻觉拦截] 答案带引用但从未搜索 → 强制补搜")
+                messages.pop()
+                results = search_and_process(question, verbose=True)
+                if results:
                     content = format_context(results)
-                    print(f"   [补搜] {len(result['results'])} 条 → 去重后 {len(results)} 条")
+                    print(f"   [补搜] 去重后 {len(results)} 条")
                     messages.append({"role": "assistant", "content": None,
                                      "tool_calls": [{"id": "force_1", "type": "function",
                                                      "function": {"name": "search_web",
@@ -398,8 +403,7 @@ def run_agent(question: str):
 
 
 # ============================================================
-# 第 4.5 块：多轮调研（深度研究）—— 拆问题 → 搜多次 → 汇总成报告
-# 和 run_agent 并存，旧函数一行不改，随时能切回去对比。
+# 第 5 块：多轮调研（深度研究）
 # ============================================================
 def _plain_chat(messages: list) -> str:
     """不带工具的纯文本问答，供"规划"和"写报告"两个阶段用"""
@@ -411,9 +415,6 @@ def _plain_chat(messages: list) -> str:
 
 def plan_questions(question: str) -> list:
     """① 让模型自己把大问题拆成 3-4 个子问题（自主规划，不是代码写死）"""
-    if USE_FAKE:
-        return [question + " 现状", question + " 最新进展"]
-
     prompt = (
         "你是一个研究规划助手。请把下面的研究问题拆成 3-4 个可以独立搜索的子问题，"
         "覆盖问题的不同方面，让每个子问题都能单独搜到有用信息。\n"
@@ -434,31 +435,6 @@ def plan_questions(question: str) -> list:
     return [question]  # 解析失败就退化成原来的单问题搜索
 
 
-def _collect_search(sub_query: str) -> list:
-    """②③ 单个子问题：搜索 → 信息层处理 → 打印日志，返回结果列表"""
-    result = search_web(sub_query)
-    if "results" not in result or not result["results"]:
-        print(f"   [搜索失败] {result.get('error', '无结果')}")
-        return []
-    before = len(result["results"])
-    processed = process_results(sub_query, result["results"])
-    print(f"   [信息层] 去重排序：{before} 条 → {len(processed)} 条")
-
-    def _clean(s):
-        for _ in range(2):
-            s = s.replace("&nbsp;", " ").replace("&amp;", "&")
-        return re.sub(r"\s+", " ", s).strip()
-
-    print(f"   [工具返回] 共 {len(processed)} 条：")
-    for r in processed:
-        title = re.split(r"\s+-\s+", _clean(r["title"]))[0][:34]
-        site = re.sub(r"\s+", "", _clean(r["site"]))
-        snippet = _clean(r["snippet"])[:80]
-        print(f"      [{r['n']}] {title}（{site}）")
-        print(f"          {snippet}...")
-    return processed
-
-
 def _merge_all(batches: list) -> list:
     """④ 跨批次全局去重 + 重新编号（避免每个子问题都从 [1] 开始）"""
     seen, merged = [], []
@@ -475,44 +451,6 @@ def _merge_all(batches: list) -> list:
     for i, r in enumerate(merged, 1):
         r["n"] = i
     return merged
-
-
-def run_deep_research(question: str):
-    print("=" * 60)
-    print(f"用户提问：{question}")
-    print(f"模式：多轮调研 · {'假模型' if USE_FAKE else MODEL}")
-    print("=" * 60)
-
-    # ① 规划：模型自己拆子问题
-    print("\n[① 规划拆解]")
-    subs = plan_questions(question)
-    print(f"   模型拆出 {len(subs)} 个子问题：")
-    for i, s in enumerate(subs, 1):
-        print(f"   {i}. {s}")
-
-    # ②③ 逐个搜索 + 信息层（同一套代码循环执行多次）
-    print("\n[②③ 逐个搜索 + 信息层]")
-    batches = []
-    for i, sub in enumerate(subs, 1):
-        print(f"\n   --- 子问题 {i}/{len(subs)}：{sub} ---")
-        batches.extend(_collect_search(sub))
-
-    # ④ 汇总去重 + 全局重新编号
-    print("\n[④ 汇总去重]")
-    merged = _merge_all(batches)
-    print(f"   所有批次共 {len(batches)} 条 → 全局去重后 {len(merged)} 条")
-    context = format_context(merged)
-
-    # ⑤ 生成报告：基于全部材料作答
-    print("\n[⑤ 生成报告]")
-    report_messages = _build_report_messages(question, context)
-    if USE_FAKE:
-        answer = f"（假模型）参考资料共 {len(merged)} 条：\n{context[:600]}"
-    else:
-        answer = _plain_chat(report_messages)
-    print(f"\n最终报告：\n{answer}")
-    print(f"\n(搜索 {len(subs)} 次，收集 {len(merged)} 条资料)")
-    return answer
 
 
 def _build_report_messages(question: str, context: str) -> list:
@@ -534,20 +472,81 @@ def _build_report_messages(question: str, context: str) -> list:
     ]
 
 
+def validate_citations(answer: str, valid_nums: set) -> tuple:
+    """校验答案里的 [n] 是否都在合法编号集合内。
+
+    返回 (是否全部合法, 越界编号列表)。这是引用校验闭环的判定环节。
+    """
+    used = {int(n) for n in re.findall(r"\[(\d+)\]", answer)}
+    invalid = sorted(n for n in used if n not in valid_nums)
+    return (not invalid, invalid)
+
+
+def generate_report(question: str, context: str, valid_nums: set, verbose: bool = False) -> str:
+    """⑤ 生成报告 + 引用校验闭环。
+
+    发现越界编号（如材料只有 5 条却写了 [9]）时，把错误反馈塞回对话让模型重答，
+    最多 MAX_CITATION_RETRY 次。正常一次通过时只有一次模型调用。
+    """
+    messages = _build_report_messages(question, context)
+    answer = _plain_chat(messages)
+    for attempt in range(1, MAX_CITATION_RETRY + 1):
+        ok, invalid = validate_citations(answer, valid_nums)
+        if ok:
+            if verbose:
+                print(f"   [引用校验] 通过，引用编号均在 1–{max(valid_nums) if valid_nums else 0} 范围内")
+            break
+        if verbose:
+            print(f"   [引用校验] 第 {attempt} 次发现越界编号 {invalid} → 带反馈重答")
+        messages = messages + [
+            {"role": "assistant", "content": answer},
+            {"role": "user", "content": (
+                f"你上一版引用了 {invalid} 这些编号，但参考资料里并不存在这些编号。"
+                "请重新写一份完整报告，所有 [编号] 必须是资料中真实出现过的，"
+                "不要编造编号；资料不足的地方如实说明。"
+            )},
+        ]
+        answer = _plain_chat(messages)
+    return answer
+
+
+def run_deep_research(question: str):
+    """命令行演示版：带完整过程日志"""
+    print("=" * 60)
+    print(f"用户提问：{question}")
+    print(f"当前模型：{MODEL}")
+    print("=" * 60)
+
+    print("\n[① 规划拆解]")
+    subs = plan_questions(question)
+    print(f"   模型拆出 {len(subs)} 个子问题：")
+    for i, s in enumerate(subs, 1):
+        print(f"   {i}. {s}")
+
+    print("\n[②③ 并发搜索 + 信息层]")
+    batches = collect_batches(subs, verbose=True)
+
+    print("\n[④ 汇总去重]")
+    merged = _merge_all(batches)
+    print(f"   所有批次共 {len(batches)} 条 → 全局去重后 {len(merged)} 条")
+    context = format_context(merged)
+
+    print("\n[⑤ 生成报告 + 引用校验]")
+    valid_nums = {r["n"] for r in merged}
+    answer = generate_report(question, context, valid_nums, verbose=True)
+    print(f"\n最终报告：\n{answer}")
+    print(f"\n(搜索 {len(subs)} 次，收集 {len(merged)} 条资料)")
+    return answer
+
+
 def research(question: str) -> dict:
     """给 API 用的纯函数：不打印日志，返回结构化结果"""
     subs = plan_questions(question)
-    batches = []
-    for sub in subs:
-        result = search_web(sub)
-        if "results" in result and result["results"]:
-            batches.extend(process_results(sub, result["results"]))
+    batches = collect_batches(subs, verbose=False)
     merged = _merge_all(batches)
     context = format_context(merged)
-    if USE_FAKE:
-        report = f"（假模型）参考资料共 {len(merged)} 条"
-    else:
-        report = _plain_chat(_build_report_messages(question, context))
+    valid_nums = {r["n"] for r in merged}
+    report = generate_report(question, context, valid_nums)
     return {
         "question": question,
         "report": report,
@@ -557,8 +556,5 @@ def research(question: str) -> dict:
     }
 
 
-# ============================================================
-# 第 5 块：跑一个例子
-# ============================================================
 if __name__ == "__main__":
     run_deep_research("AI Agent 框架 LangGraph 和 AutoGen 有什么区别，各自适合什么场景？")
